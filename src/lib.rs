@@ -265,8 +265,8 @@
 //! ```
 use std::io::{self, Write};
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use owo_colors::{OwoColorize, Style};
@@ -743,6 +743,7 @@ impl<W, F, S> ConsoleLayer<W, F, S> {
 struct ConsoleSpanInfo {
     extra: Option<String>,
     has_failed: AtomicBool,
+    started: OnceLock<Instant>,
 }
 
 impl<S, W, F, St> Layer<S> for ConsoleLayer<W, F, St>
@@ -766,6 +767,7 @@ where
             span.extensions_mut().insert(ConsoleSpanInfo {
                 extra: visitor.extra,
                 has_failed: AtomicBool::new(false),
+                started: OnceLock::new(),
             });
         }
     }
@@ -778,14 +780,14 @@ where
     /// block of execution has started.
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
-            if span.extensions().get::<Instant>().is_some() {
-                return;
-            }
-            span.extensions_mut().insert(Instant::now());
-
-            let metadata = span.metadata();
             let extensions = span.extensions();
             let info = extensions.get::<ConsoleSpanInfo>().unwrap();
+            // Only the first entry prints the header, even if threads race here.
+            if info.started.set(Instant::now()).is_err() {
+                return;
+            }
+
+            let metadata = span.metadata();
             let depth = span.scope().from_root().count() - 1;
             let start_symbol = if depth == 0 {
                 Self::HEADER_START
@@ -903,9 +905,7 @@ where
             let extensions = span.extensions();
             let info = extensions.get::<ConsoleSpanInfo>().unwrap();
 
-            let duration = extensions
-                .get::<Instant>()
-                .map(|start_time| start_time.elapsed());
+            let duration = info.started.get().map(|start_time| start_time.elapsed());
 
             let metadata = span.metadata();
             let has_failed = info.has_failed.load(Ordering::SeqCst);
@@ -1245,6 +1245,38 @@ mod tests {
     fn test_simple_span() {
         let writer = MockWriter::new();
         let subscriber = Registry::default().with(ConsoleLayer::with_writer(writer.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!("simple").entered();
+            console!(info, "It works!");
+        });
+
+        let output = strip_non_deterministic(&writer.to_string());
+        insta::assert_snapshot!(output, @r###"
+        ╭─ ⚙ simple
+        │  ├─ ✔ It works!
+        ╰─ ✔ simple succeeded
+        "###);
+    }
+
+    #[test]
+    fn test_other_layer_storing_instant() {
+        // Span extensions are shared by all layers, so a plain `Instant` stored
+        // by another layer must not hide the span header.
+        struct Timing;
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Timing {
+            fn on_new_span(&self, _: &tracing::span::Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+                ctx.span(id)
+                    .unwrap()
+                    .extensions_mut()
+                    .insert(Instant::now());
+            }
+        }
+
+        let writer = MockWriter::new();
+        let subscriber = Registry::default()
+            .with(Timing)
+            .with(ConsoleLayer::with_writer(writer.clone()));
 
         tracing::subscriber::with_default(subscriber, || {
             let _span = tracing::info_span!("simple").entered();
