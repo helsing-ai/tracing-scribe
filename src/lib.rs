@@ -593,6 +593,12 @@ fn format_duration(d: Duration) -> String {
 /// This layer is responsible for the hierarchical and colorful output, including
 /// span timings, status icons, and error propagation. It keeps track of the
 /// state of each span and formats messages accordingly.
+///
+/// # Panics
+///
+/// A subscriber can hold only one `ConsoleLayer`. With two of them, creating a
+/// span panics, because both layers keep their per-span state in the same slot
+/// of the span's extensions.
 #[derive(Debug)]
 pub struct ConsoleLayer<W, F = DefaultStatusFactory, S = DefaultStatus> {
     make_writer: W,
@@ -764,6 +770,12 @@ where
             let mut visitor = FieldVisitor::default();
             attrs.record(&mut visitor);
 
+            // Span extensions are shared by all layers, so a second ConsoleLayer
+            // finds the info the first one stored.
+            assert!(
+                span.extensions().get::<ConsoleSpanInfo>().is_none(),
+                "ConsoleLayer was added more than once to the same subscriber"
+            );
             span.extensions_mut().insert(ConsoleSpanInfo {
                 extra: visitor.extra,
                 has_failed: AtomicBool::new(false),
@@ -1289,6 +1301,18 @@ mod tests {
         │  ├─ ✔ It works!
         ╰─ ✔ simple succeeded
         "###);
+    }
+
+    #[test]
+    #[should_panic(expected = "ConsoleLayer was added more than once to the same subscriber")]
+    fn test_two_console_layers() {
+        let subscriber = Registry::default()
+            .with(ConsoleLayer::with_writer(MockWriter::new()))
+            .with(ConsoleLayer::with_writer(MockWriter::new()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!("simple").entered();
+        });
     }
 
     #[test]
