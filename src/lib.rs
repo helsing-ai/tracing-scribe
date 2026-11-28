@@ -975,6 +975,7 @@ impl Visit for FieldVisitor {
             "message" => self.message = value.to_string(),
             "status" => self.status = value.to_string(),
             "extra" => self.extra = Some(value.to_string()),
+            "error" => self.error = Some(value.to_string()),
             _ => {}
         }
     }
@@ -987,11 +988,15 @@ impl Visit for FieldVisitor {
         }
     }
 
-    /// Captures debug-formatted values, primarily used for extracting error
-    /// information from the `error` field.
+    /// Captures debug-formatted values. `tracing` records the message of
+    /// `tracing::error!("...")`, `%value` fields and numbers through this
+    /// method, so it reads `message`, `extra` and `error` like `record_str`.
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "error" {
-            self.error = Some(format!("{value:?}"));
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "extra" => self.extra = Some(format!("{value:?}")),
+            "error" => self.error = Some(format!("{value:?}")),
+            _ => {}
         }
     }
 }
@@ -1357,6 +1362,45 @@ mod tests {
         │  │  ├─ ⨯ An error occurred
         │  ╰─ ⨯ inner
         ╰─ ⨯ outer failed
+        ");
+    }
+
+    #[test]
+    fn test_tracing_error_fields() {
+        let writer = MockWriter::new();
+        let subscriber = Registry::default().with(ConsoleLayer::with_writer(writer.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let path = std::path::Path::new("/etc/app.toml");
+            let _load = tracing::info_span!("load", extra = %path.display()).entered();
+            {
+                let _attempt = tracing::info_span!("attempt", extra = 1).entered();
+                tracing::error!("disk full");
+            }
+            {
+                let _open = tracing::info_span!("open").entered();
+                let e = io::Error::other("permission denied");
+                tracing::error!(error = %e, "failed to open config");
+            }
+            {
+                let _parse = tracing::info_span!("parse").entered();
+                tracing::error!(error = "unexpected token");
+            }
+        });
+
+        let output = strip_non_deterministic(&writer.to_string());
+        insta::assert_snapshot!(output, @r"
+        ╭─ ⚙ load /etc/app.toml
+        │  ╭─ ⚙ attempt 1
+        │  │  ├─ ⨯ disk full
+        │  ╰─ ⨯ attempt 1
+        │  ╭─ ⚙ open
+        │  │  ├─ ⨯ failed to open config: permission denied
+        │  ╰─ ⨯ open
+        │  ╭─ ⚙ parse
+        │  │  ├─ ⨯ unexpected token
+        │  ╰─ ⨯ parse
+        ╰─ ⨯ load /etc/app.toml failed
         ");
     }
 
@@ -1727,7 +1771,7 @@ mod tests {
         │  │  ╰─ ✔ templates
         │  │  ╭─ ⚙ dependencies
         │  │  │  ├─ ✔ 1445 transitive dependencies found
-        │  │  │  ├─ ⨯ 
+        │  │  │  ├─ ⨯ something
         │  │  ╰─ ⨯ dependencies
         │  ╰─ ⨯ gen
         ╰─ ⨯ cli cli failed
