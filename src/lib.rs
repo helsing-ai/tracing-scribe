@@ -1059,6 +1059,14 @@ pub mod macros {
     pub fn format_failure<E: Display>(err: &E, message: String) -> String {
         format!("{}: {}", message, err.to_string().red())
     }
+
+    /// Colors a success value green, the default for the `console!` macro.
+    ///
+    /// The macro calls this through `$crate` so that callers do not need
+    /// `owo_colors::OwoColorize` in scope.
+    pub fn default_colorize(s: String) -> String {
+        s.green().to_string()
+    }
 }
 
 #[doc(hidden)]
@@ -1137,7 +1145,6 @@ macro_rules! __console_impl_result {
 ///
 /// ```rust
 /// # use tracing_scribe::console;
-/// # use owo_colors::OwoColorize;
 /// # fn main() {
 /// let successful_result: Result<&str, &str> = Ok("everything is fine");
 /// console!(successful_result, "A successful operation");
@@ -1151,7 +1158,6 @@ macro_rules! __console_impl_result {
 ///
 /// ```rust
 /// # use tracing_scribe::console;
-/// # use owo_colors::OwoColorize;
 /// # fn main() {
 /// let successful_result: Result<(), &str> = Ok(());
 /// console!(successful_result, "An operation with no output");
@@ -1162,7 +1168,7 @@ macro_rules! __console_impl_result {
 ///
 /// ```rust
 /// # use tracing_scribe::console;
-/// # use owo_colors::OwoColorize;
+/// use owo_colors::OwoColorize;
 /// # fn main() {
 /// let successful_result: Result<&str, &str> = Ok("everything is fine");
 /// console!(successful_result, |s: String| s.blue().to_string(), "A successful operation with custom colors");
@@ -1185,11 +1191,15 @@ macro_rules! console {
     (error, $($arg:tt)+) => {
         tracing::event!(tracing::Level::ERROR, console = true, status = "error", message = &format!($($arg)+));
     };
+    // Before the `$color:expr` arm, which would take the format string as the color.
+    ($result:expr, $fmt:literal $($arg:tt)*) => {
+        $crate::__console_impl_result!($result, $crate::macros::default_colorize, $fmt $($arg)*)
+    };
     ($result:expr, $color:expr, $($arg:tt)+) => {
         $crate::__console_impl_result!($result, $color, $($arg)+)
     };
     ($result:expr, $($arg:tt)+) => {
-        $crate::__console_impl_result!($result, |s: String| s.green().to_string(), $($arg)+)
+        $crate::__console_impl_result!($result, $crate::macros::default_colorize, $($arg)+)
     };
 }
 
@@ -1679,6 +1689,29 @@ mod tests {
         ╭─ ⚙ result_unit
         │  ├─ ✔ Operation without output
         ╰─ ✔ result_unit succeeded
+        "###);
+    }
+
+    #[test]
+    fn test_console_result_format_args() {
+        let writer = MockWriter::new();
+        let subscriber = Registry::default().with(ConsoleLayer::with_writer(writer.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!("result_args").entered();
+            let res: Result<&str, &str> = Ok("all good");
+            console!(res, "Operation {}", 1).unwrap();
+
+            let res: Result<(), &str> = Err("very bad");
+            console!(res, "Operation {} of {}", 2, 2).unwrap_err();
+        });
+
+        let output = strip_non_deterministic(&writer.to_string());
+        insta::assert_snapshot!(output, @r###"
+        ╭─ ⚙ result_args
+        │  ├─ ✔ Operation 1: all good
+        │  ├─ ⨯ Operation 2 of 2: very bad
+        ╰─ ⨯ result_args failed
         "###);
     }
 
